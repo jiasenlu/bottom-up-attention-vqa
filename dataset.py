@@ -1,6 +1,7 @@
 from __future__ import print_function
 import os
-import json
+import os.path as pth
+import ujson as json
 import cPickle
 import numpy as np
 import utils
@@ -8,6 +9,8 @@ import h5py
 import torch
 from torch.utils.data import Dataset
 
+import torchvision.transforms as transforms
+from torchvision.datasets.folder import default_loader
 
 class Dictionary(object):
     def __init__(self, word2idx=None, idx2word=None):
@@ -72,12 +75,13 @@ def _create_entry(img, question, answer):
     return entry
 
 
-def _load_dataset(dataroot, name, img_id2val):
+def _load_dataset(dataroot, name, img_id2val, coco_dir=None):
     """Load entries
 
     img_id2val: dict {img_id -> val} val can be used to retrieve image or features
     dataroot: root path of dataset
     name: 'train', 'val'
+    coco_dir: if provided include paths to images
     """
     question_path = os.path.join(
         dataroot, 'v2_OpenEnded_mscoco_%s2014_questions.json' % name)
@@ -86,6 +90,9 @@ def _load_dataset(dataroot, name, img_id2val):
     answer_path = os.path.join(dataroot, 'cache', '%s_target.pkl' % name)
     answers = cPickle.load(open(answer_path, 'rb'))
     answers = sorted(answers, key=lambda x: x['question_id'])
+    if coco_dir:
+        coco_img_dir = pth.join(coco_dir, 'images', name + '2014')
+        coco_img_format = pth.join(coco_img_dir, 'COCO_'+name+'2014_{:0>12d}.jpg').format
 
     utils.assert_eq(len(questions), len(answers))
     entries = []
@@ -94,14 +101,20 @@ def _load_dataset(dataroot, name, img_id2val):
         utils.assert_eq(question['image_id'], answer['image_id'])
         img_id = question['image_id']
         entries.append(_create_entry(img_id2val[img_id], question, answer))
-
+        if coco_dir:
+            entries[-1]['image_path'] = coco_img_format(img_id)
     return entries
 
 
 class VQAFeatureDataset(Dataset):
-    def __init__(self, name, dictionary, dataroot='data'):
+    def __init__(self, name, dictionary, dataroot='data', img_type='features',
+                 coco_dir=None, img_size=256, crop_size=None, crop=None):
         super(VQAFeatureDataset, self).__init__()
         assert name in ['train', 'val']
+        # use pre-computed features or load images from file
+        assert img_type in ['features', 'image']
+        self.img_type = img_type
+        self.img_size = img_size
 
         ans2label_path = os.path.join(dataroot, 'cache', 'trainval_ans2label.pkl')
         label2ans_path = os.path.join(dataroot, 'cache', 'trainval_label2ans.pkl')
@@ -113,18 +126,34 @@ class VQAFeatureDataset(Dataset):
 
         self.img_id2idx = cPickle.load(
             open(os.path.join(dataroot, '%s36_imgid2idx.pkl' % name)))
-        print('loading features from h5 file')
-        h5_path = os.path.join(dataroot, '%s36.hdf5' % name)
-        with h5py.File(h5_path, 'r') as hf:
-            self.features = np.array(hf.get('image_features'))
-            self.spatials = np.array(hf.get('spatial_features'))
+        if img_type == 'features':
+            print('loading features from h5 file')
+            h5_path = os.path.join(dataroot, '%s36.hdf5' % name)
+            with h5py.File(h5_path, 'r') as hf:
+                self.features = np.array(hf.get('image_features'))
+                self.spatials = np.array(hf.get('spatial_features'))
 
-        self.entries = _load_dataset(dataroot, name, self.img_id2idx)
+        self.entries = _load_dataset(dataroot, name, self.img_id2idx, coco_dir)
 
         self.tokenize()
         self.tensorize()
-        self.v_dim = self.features.size(2)
-        self.s_dim = self.spatials.size(2)
+        if img_type == 'features':
+            self.v_dim = self.features.size(2)
+            self.s_dim = self.spatials.size(2)
+        if img_type == 'image':
+            transform_lst = [
+                transforms.Resize((img_size, img_size)),
+            ]
+            if crop == 'random':
+                transform_lst.append(transforms.RandomCrop(crop_size))
+            elif crop == 'center':
+                transform_lst.append(transforms.CenterCrop(crop_size))
+            transform_lst.extend([
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406],
+                                     [0.229, 0.224, 0.225]),
+            ])
+            self.res_transform = transforms.Compose(transform_lst)
 
     def tokenize(self, max_length=14):
         """Tokenizes the questions.
@@ -143,8 +172,9 @@ class VQAFeatureDataset(Dataset):
             entry['q_token'] = tokens
 
     def tensorize(self):
-        self.features = torch.from_numpy(self.features)
-        self.spatials = torch.from_numpy(self.spatials)
+        if self.img_type == 'features':
+            self.features = torch.from_numpy(self.features)
+            self.spatials = torch.from_numpy(self.spatials)
 
         for entry in self.entries:
             question = torch.from_numpy(np.array(entry['q_token']))
@@ -162,10 +192,21 @@ class VQAFeatureDataset(Dataset):
                 entry['answer']['labels'] = None
                 entry['answer']['scores'] = None
 
+    def _spatial(self, features):
+        # TODO: just a dummy; actually implement if needed
+        if not hasattr(self, '_spatial_features'):
+            self._spatial_features = torch.from_numpy(np.zeros(6))
+        return self._spatial_features
+
     def __getitem__(self, index):
         entry = self.entries[index]
-        features = self.features[entry['image']]
-        spatials = self.spatials[entry['image']]
+        if self.img_type == 'features':
+            features = self.features[entry['image']]
+            spatials = self.spatials[entry['image']]
+        elif self.img_type == 'image':
+            img = default_loader(entry['image_path'])
+            features = self.res_transform(img)
+            spatials = self._spatial(features)
 
         question = entry['q_token']
         answer = entry['answer']
@@ -175,7 +216,13 @@ class VQAFeatureDataset(Dataset):
         if labels is not None:
             target.scatter_(0, labels, scores)
 
-        return features, spatials, question, target
+        result = {
+            'image': features,
+            'spatial': spatials,
+            'question': question,
+            'answer': target,
+        }
+        return result
 
     def __len__(self):
         return len(self.entries)
